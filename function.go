@@ -40,14 +40,8 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 		formData[e.Attr("name")] = e.Attr("value")
 	})
 
-	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting", r.URL)
-	})
-
-  // TODO need to replace hardcoded url
 	c.Visit("https://sso.ui.ac.id/cas2/login?service=http%3A%2F%2Flocalhost%3A8081%2F")
 	c.Wait()
-	fmt.Println(formData)
 
 	c = c.Clone()
 	c.OnResponse(func(r *colly.Response) {
@@ -58,7 +52,6 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 			c.SetCookies(r.Request.URL.String(), req.Cookies())
 		}
 
-		fmt.Println(r.Headers.Values("Set-Cookie"))
 	})
 
 	c.Post("https://sso.ui.ac.id/cas2/login?service=http%3A%2F%2Flocalhost%3A8081%2F", formData)
@@ -69,7 +62,6 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 	c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
 		r, _ := http.NewRequest(http.MethodGet, req.URL.String(), nil)
 		ticket = r.URL.Query()["ticket"][0]
-		fmt.Println("ticket", ticket)
 		return nil
 	})
 	c.Visit("https://sso.ui.ac.id/cas2/login?service=http%3A%2F%2Flocalhost%3A8081%2F")
