@@ -25,7 +25,7 @@ type Request struct {
 }
 
 func Proxy(w http.ResponseWriter, r *http.Request) {
-	defaultServiceUrl := url.QueryEscape("http://localhost:8081/")
+	defaultServiceUrl := "http://localhost:8081/"
 	defaultCasUrl := "https://sso.ui.ac.id/cas2/"
 
 	defer func() {
@@ -54,6 +54,17 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 	if data.ServiceUrl == "" {
 		data.ServiceUrl = defaultServiceUrl
 	}
+
+	serviceUrl, err := url.Parse(data.ServiceUrl)
+	if err != nil {
+		res, _ := json.Marshal(map[string]string{
+			"error": "failed to parse service url: " + err.Error(),
+		})
+		http.Error(w, string(res), http.StatusBadRequest)
+		return
+	}
+
+	data.ServiceUrl = url.QueryEscape(serviceUrl.String())
 
 	if data.CasUrl == "" {
 		data.CasUrl = defaultCasUrl
