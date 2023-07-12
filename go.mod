@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/GoogleCloudPlatform/functions-framework-go v1.5.3
+	github.com/clbanning/mxj/v2 v2.5.7
 	github.com/gocolly/colly/v2 v2.1.0
 )
 
@@ -16,7 +17,6 @@ require (
 	github.com/antchfx/xpath v1.1.8 // indirect
 	github.com/cloudevents/sdk-go/v2 v2.6.1 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
-	github.com/golang-jwt/jwt/v4 v4.1.0 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/uuid v1.1.2 // indirect
@@ -24,7 +24,6 @@ require (
 	github.com/kennygrant/sanitize v1.2.4 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
 	github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742 // indirect
-	github.com/ristekoss/golang-sso-ui-jwt v0.0.0-20220526172409-fe7320a87b7d // indirect
 	github.com/saintfish/chardet v0.0.0-20120816061221-3af4cd4741ca // indirect
 	github.com/temoto/robotstxt v1.1.1 // indirect
 	go.uber.org/atomic v1.4.0 // indirect

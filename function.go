@@ -3,11 +3,14 @@ package function
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"net/url"
+
+	"github.com/clbanning/mxj/v2"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/gocolly/colly/v2"
-	ssojwt "github.com/ristekoss/golang-sso-ui-jwt"
 )
 
 func init() {
@@ -15,20 +18,48 @@ func init() {
 }
 
 type Request struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	ServiceUrl string `json:"serviceUrl"`
+	CasUrl     string `json:"casUrl"`
 }
 
 func Proxy(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	defaultServiceUrl := url.QueryEscape("http://localhost:8081/")
+	defaultCasUrl := "https://sso.ui.ac.id/cas2/"
+
+	defer func() {
+		if r := recover(); r != nil {
+			res, _ := json.Marshal(map[string]string{
+				"error": fmt.Sprint(r),
+			})
+			http.Error(w, string(res), http.StatusInternalServerError)
+		}
+	}()
+
 	var data Request
+	w.Header().Set("Content-Type", "application/json")
+
 	defer r.Body.Close()
 	decoder := json.NewDecoder(r.Body)
 
 	if err := decoder.Decode(&data); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		res, _ := json.Marshal(map[string]string{
+			"error": "failed to decode request: " + err.Error(),
+		})
+		http.Error(w, string(res), http.StatusBadRequest)
 		return
 	}
+
+	if data.ServiceUrl == "" {
+		data.ServiceUrl = defaultServiceUrl
+	}
+
+	if data.CasUrl == "" {
+		data.CasUrl = defaultCasUrl
+	}
+
+	loginUrl := fmt.Sprint(data.CasUrl, "login?service=", data.ServiceUrl)
 
 	formData := map[string]string{
 		"username": data.Username,
@@ -40,10 +71,21 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 		formData[e.Attr("name")] = e.Attr("value")
 	})
 
-	c.Visit("https://sso.ui.ac.id/cas2/login?service=http%3A%2F%2Flocalhost%3A8081%2F")
+	// get login page
+	c.Visit(loginUrl)
 	c.Wait()
 
+	var ticket string
 	c = c.Clone()
+	c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
+		ticketList := req.URL.Query()["ticket"]
+		if len(ticketList) > 0 {
+			ticket = ticketList[0]
+		}
+
+		return fmt.Errorf("redirect")
+	})
+
 	c.OnResponse(func(r *colly.Response) {
 		for _, val := range r.Headers.Values("Set-Cookie") {
 			header := http.Header{}
@@ -51,26 +93,2069 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 			req := http.Response{Header: header}
 			c.SetCookies(r.Request.URL.String(), req.Cookies())
 		}
-
 	})
 
-	c.Post("https://sso.ui.ac.id/cas2/login?service=http%3A%2F%2Flocalhost%3A8081%2F", formData)
+	// login
+	c.Post(loginUrl, formData)
 	c.Wait()
 
-	var ticket string
-	c = c.Clone()
-	c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
-		r, _ := http.NewRequest(http.MethodGet, req.URL.String(), nil)
-		ticket = r.URL.Query()["ticket"][0]
-		return nil
-	})
-	c.Visit("https://sso.ui.ac.id/cas2/login?service=http%3A%2F%2Flocalhost%3A8081%2F")
-	c.Wait()
+	// if ticket is empty, then try to incure redirection with cookie
+	if ticket == "" {
+		c = c.Clone()
+		c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
+			ticketList := req.URL.Query()["ticket"]
+			if len(ticketList) > 0 {
+				ticket = ticketList[0]
+			}
 
-	config := ssojwt.MakeSSOConfig(0, 0, "", "", "http%3A%2F%2Flocalhost%3A8081%2F", "")
-	bodyBytes, _ := ssojwt.ValidatTicket(config, ticket)
-	model, _ := ssojwt.Unmarshal(bodyBytes)
+			return fmt.Errorf("redirect")
+		})
+
+		c.Visit(loginUrl)
+		c.Wait()
+	}
+
+	// failed to login
+	if ticket == "" {
+		res, _ := json.Marshal(map[string]string{
+			"error": "failed to login",
+		})
+		http.Error(w, string(res), http.StatusBadRequest)
+		return
+	}
+
+	bodyBytes, err := validateTicket(data.CasUrl, data.ServiceUrl, ticket)
+	if err != nil {
+		res, _ := json.Marshal(map[string]string{
+			"error": "failed to validate ticket: " + err.Error(),
+		})
+		http.Error(w, string(res), http.StatusInternalServerError)
+		return
+	}
+
+	model, err := Unmarshal(bodyBytes)
+	if err != nil {
+		res, _ := json.Marshal(map[string]string{
+			"error": "failed to parse xml: " + err.Error(),
+		})
+		http.Error(w, string(res), http.StatusInternalServerError)
+		return
+	}
+
 	res, _ := json.Marshal(model)
-
 	fmt.Fprintln(w, string(res))
+}
+
+func validateTicket(casUrl, serviceUrl, ticket string) (bodyBytes []byte, err error) {
+	url := fmt.Sprintf("%sserviceValidate?ticket=%s&service=%s", casUrl, ticket, serviceUrl)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	bodyBytes, err = ioutil.ReadAll(resp.Body)
+	return bodyBytes, nil
+}
+
+func Unmarshal(bodyBytes []byte) (model map[string]any, err error) {
+	model, err = mxj.NewMapXml(bodyBytes)
+	if err != nil {
+		err = fmt.Errorf("error in unmarshaling: %w", err)
+		return nil, err
+	}
+
+	if serviceResponse, ok := model["serviceResponse"].(map[string]any); ok {
+		if serviceResponse, ok := serviceResponse["authenticationSuccess"].(map[string]any); ok {
+			if attributes, ok := serviceResponse["attributes"].(map[string]any); ok {
+				if kdOrg, ok := attributes["kd_org"].(string); ok {
+					attributes["jurusan"] = readOrgcode(kdOrg)
+				}
+			}
+		}
+	}
+
+	return model, nil
+}
+
+// ignore anyting below this line
+type Jurusan struct {
+	Faculty      string `json:"faculty"`
+	ShortFaculty string `json:"shortFaculty"`
+	Major        string `json:"major"`
+	Program      string `json:"program"`
+}
+
+// Generated by https://quicktype.io
+
+func readOrgcode(kdOrg string) (jurusan Jurusan) {
+	data := map[string]Jurusan{
+		"04.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Pendidikan Dokter (Medical Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"05.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Pendidikan Dokter Kelas Khusus Internasional (Medical Science)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"07.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Biomedik (Biomedical Sciences)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"08.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Gizi (Nutrition)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"09.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Kedokteran Kerja (Occupational Medicine)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"40.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Pendidikan Kedokteran (Medical Education)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"10.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Biomedik (Biomedical Sciences)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"11.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Gizi (Nutrition)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"12.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kedokteran (Medical Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"01.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Perumahsakitan (Hospital Management)",
+			Program:      "D3 (Diploma III)",
+		},
+		"02.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Rehabilitasi Medik ()",
+			Program:      "D3 (Diploma III)",
+		},
+		"37.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Fisioterapi (Physiotherapy)",
+			Program:      "D3 (Diploma III)",
+		},
+		"38.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Okupasi Terapi (Occupational Therapy)",
+			Program:      "D3 (Diploma III)",
+		},
+		"06.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Profesi Dokter (Medical Doctor)",
+			Program:      "Profesi (Profession Program)",
+		},
+		"13.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Anestesiologi (Anesthesiology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"14.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Bedah (Surgery)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"15.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Penyakit Dalam (Internal Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"16.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kesehatan Anak (Pediatrics)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"17.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Obstetri & Ginekologi (Obstetrics & Gynecology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"18.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Penyakit Saraf (Neurology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"19.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kedokteran Jiwa (Psychiatry)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"20.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kesehatan Mata (Ophthalmology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"21.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kesehatan Kulit & Kelamin (Dermato & Venereology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"22.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Penyakit Telinga, Hidung & Tenggorok (Otorhinolaryngology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"23.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Penyakit Jantung & Pembuluh Darah (Cardiovascular Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"24.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Pulmonologi dan Ilmu Kedokteran Respirasi (Respiratory)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"25.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Radiologi (Radiology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"26.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kedokteran Forensik (Forensic Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"27.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Patologi Anatomik (Anatomical Pathology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"28.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Patologi Klinik (Clinical Pathology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"29.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Orthopaedi dan Traumatologi (Orthopaedic and Traumatology Surgery)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"30.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Urologi (Urology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"31.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Bedah Syaraf (Neurosurgery)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"32.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Rehabilitasi Medik (Medical Rehabilitation)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"33.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Bedah Plastik (Plastic Surgery)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"34.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Kedokteran Olahraga (Sports Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"35.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Mikrobiologi Klinik (Clinical Microbiology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"36.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Farmakologi Klinik (Clinical Pharmacology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"39.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Kedokteran Okupasi (Occupational Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"41.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Bedah Torak Kardiovaskular (Cardiovascular and Thoracic Surgery)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"43.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Onkologi Radiasi (Radiation Oncology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"44.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Kedokteran Penerbangan (Aviation Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"45.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Gizi Klinik (Clinical Nutrition)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"46.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Parasitologi Klinik (Clinical Parasitology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"47.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Akupuntur Medik (Acupuncture Medic)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"03.00.01.01": {
+			Faculty:      "Kedokteran",
+			ShortFaculty: "FK",
+			Major:        "Ilmu Gizi ()",
+			Program:      "D4 (Diploma IV)",
+		},
+		"01.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Pendidikan Dokter Gigi (Dental Education)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"03.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Kedokteran Gigi Dasar (Basic Dental Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Kedokteran Gigi Komunitas (Community Dental Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Kedokteran Gigi (Dental Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"02.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Kedokteran Gigi (Dentistry)",
+			Program:      "Profesi (Profession Program)",
+		},
+		"06.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Bedah Mulut (Oral & Maxillo Facial Surgery)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"07.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Kesehatan Gigi Anak (Pediatric Dentistry)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"08.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Konservasi Gigi (Conservative Dentistry)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"09.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ilmu Penyakit Mulut (Oral Medicine)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"10.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Ortodonsia (Orthodontics)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"11.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Periodonsia (Periodontology)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"12.00.02.01": {
+			Faculty:      "Kedokteran Gigi",
+			ShortFaculty: "FKG",
+			Major:        "Prostodonsia (Prosthetic Dentistry)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"01.01.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Matematika (Mathematics)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.04.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Biologi (Biology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.06.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Geografi (Geography)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.02.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Fisika (Physics)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.03.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Kimia (Chemistry)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.01.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Matematika (Mathematics)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.04.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Biologi (Biology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.06.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Geografi (Geography Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.04.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Kelautan (Nautical Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.06.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Bahan-bahan (Material Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.02.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Fisika (Physics Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.03.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Kimia (Chemistry Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.04.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Biologi (Biology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"04.06.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Bahan-bahan (Material Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"05.03.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Ilmu Kimia (Chemistry Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.01.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Matematika (Mathematics)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"05.02.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Fisika (Physics)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"05.04.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Biologi (Biology)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"05.06.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Geografi (Geography)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"06.03.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Kimia (Chemistry)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Sipil (Civil Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Mesin (Mechanical Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro (Electrical Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.04.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Metalurgi & Material (Metalurgy & Material Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur (Architecture)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Kimia (Chemical Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.07.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Industri (Industrial Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Lingkungan (Environment Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Perkapalan (Naval Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Komputer (Computer Engineering)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"05.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur Interior (Interior Architechture)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"06.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknologi Bioproses (Bioprocess Technology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.04.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Metalurgi & Material - Ekstensi (Metalurgy & Material Engineering - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"02.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur - Ekstensi (Architecture - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"02.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Kimia - Ekstensi (Chemical Engineering - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"02.07.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Industri - Ekstensi (Industrial Engineering - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"03.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Sipil - Ekstensi (Civil Engineering - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"03.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Mesin - Ekstensi (Mechanical Engineering - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"03.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro - Ekstensi (Electrical Engineering - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"03.04.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Metalurgi - Intl (Metalurgy Engineering - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"03.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Kimia - Intl (Chemical Engineering - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"04.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Sipil - Intl (Civil Engineering - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"04.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Mesin - Intl (Mechanical Engineering - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"04.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro - Intl (Electrical Engineering - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"04.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur - Intl (Architecture - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"03.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur (Architecture)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.07.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Industri (Industrial Engineering)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.04.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Metalurgi & Material (Metalurgy & Material Engineering)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Kimia (Chemical Engineering)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Sipil (Civil Engineering - Graduate)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Mesin (Mechanical Engineering)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro (Electrical Engineering)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"06.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Opto Elektroteknika & Aplikasi Laser (Optoelectronics & Laser Application)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.04.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Metalurgi & Material (Metalurgy & Material Engineering)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"05.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Kimia (Chemical Engineering)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"06.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Sipil (Civil Engineering)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"06.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Mesin (Mechanical Engineering)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"06.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur (Architecture)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"07.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Opto Elektroteknika & Aplikasi Laser (Optoelectronics & Laser Application)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"08.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro (Electrical Engineering)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"07.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Pendidikan Profesi Arsitek (Architect)",
+			Program:      "Profesi (Profession Program)",
+		},
+		"09.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro - Intl (Electrical Engineering - Intl)",
+			Program:      "S2 Kls Internasional (Intl. Class Graduate Program)",
+		},
+		"04.07.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Industri (Industrial Engineering)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"06.04.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Metalurgi & Material (Metalurgy & Material Engineering)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"07.01.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Sipil (Civil Engineering)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"07.02.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Mesin (Mechanical Engineering)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"07.06.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Kimia (Chemical Engineering)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"08.05.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Arsitektur (Architecture)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"10.03.04.01": {
+			Faculty:      "Teknik",
+			ShortFaculty: "FT",
+			Major:        "Teknik Elektro (Electrical Engineering)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Ilmu Hukum (Law)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Ilmu Hukum - Ekstensi (Law)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"07.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Ilmu Hukum (Law - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"03.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Ilmu Hukum (Law)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Kenotariatan (Notary)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Ilmu Hukum (Law)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"06.00.05.01": {
+			Faculty:      "Hukum",
+			ShortFaculty: "FH",
+			Major:        "Ilmu Hukum (Law)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Ekonomi (Economics)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Manajemen (Management)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Akuntansi (Accounting)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"07.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Ekonomi Islam (Islam Economic Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"08.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Bisnis Islam (Islam Business)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"03.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Manajemen - Ekstensi (Management)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"03.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Akuntansi - Ekstensi (Accounting)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"02.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Ekonomi (Economics International)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"02.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Manajemen (Management - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"04.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Akuntansi (Accounting - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"03.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Ekonomi (Economics)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Perencanaan & Kebijakan Publik (MPKP) (Planning & Public Policy)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Manajemen (Management)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Magister Manajemen (Master of Management)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"06.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Magister Akuntansi (Master Of Accounting Program)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"07.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Magister Manajemen (Master of Management)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"07.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Akuntansi (Accounting)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"09.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Magister Akuntansi (Master of Accounting Program)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Ekonomi (Economics)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"06.02.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Manajemen (Management)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"08.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Akuntansi (Accounting)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"01.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Akuntansi (Accounting)",
+			Program:      "D3 (Diploma III)",
+		},
+		"05.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Pendidikan Profesi Akuntansi (PPAk) (Accounting Profession Education)",
+			Program:      "Profesi (Profession Program)",
+		},
+		"06.01.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Ilmu Ekonomi ()",
+			Program:      "S2 Kls Internasional (Intl. Class Graduate Program)",
+		},
+		"10.03.06.01": {
+			Faculty:      "Ekonomi",
+			ShortFaculty: "FEB",
+			Major:        "Akuntansi (Accounting)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.01.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Arkeologi (Archaeology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.02.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Filsafat (Philosophy)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.06.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Sejarah (History)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.03.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Perpustakaan (Library Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"08.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Arab (Arabic)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"09.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Indonesia (Indonesian)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"10.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Daerah untuk Sastra Jawa (Javanese)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"11.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Cina (Chinese)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"12.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Jepang (Japanese)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"13.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Inggris (English)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"14.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Perancis (French)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"15.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Jerman (German)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"16.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Rusia (Russian)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"17.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Belanda (Dutch)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"18.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Bahasa dan Kebudayaan Korea (Korean)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.05.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Susastra (Sastra) (Literature)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.01.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Arkeologi (Archaeology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.02.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Filsafat (Philosophy)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.06.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Sejarah (History Science - Graduate)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.03.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Perpustakaan (Library Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.04.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Linguistik (Linguistics)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"28.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Asia Tenggara (Southeast Asia)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.05.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Susastra (Sastra) (Literature)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.01.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Arkeologi (Archaeology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.02.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Filsafat (Philosophy)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.06.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Sejarah (History)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"05.04.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Linguistik (Linguistics)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"01.04.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Penerjemahan Bahasa Arab (Arabic Translation)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"02.04.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Penerjemahan Bahasa Inggris (English Translation)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"03.04.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Penerjemahan Bahasa Perancis (French Translation)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"05.03.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Ilmu Perpustakaan (Library Science)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"19.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Cina (Chinese)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"20.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Arab (Arabic)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"21.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Jepang (Japanese)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"22.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Inggris (English)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"23.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Perancis (French)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"24.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Jerman (German)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"26.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Sastra Belanda (Dutch)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"27.00.07.01": {
+			Faculty:      "Ilmu Pengetahuan Budaya",
+			ShortFaculty: "FIB",
+			Major:        "Bahasa dan Kebudayaan Korea (Korean)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.00.08.01": {
+			Faculty:      "Psikologi",
+			ShortFaculty: "FPsi",
+			Major:        "Psikologi (Psychology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.00.08.01": {
+			Faculty:      "Psikologi",
+			ShortFaculty: "FPsi",
+			Major:        "Psikologi (Psychology)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"04.00.08.01": {
+			Faculty:      "Psikologi",
+			ShortFaculty: "FPsi",
+			Major:        "Ilmu Psikologi (Psychology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"06.00.08.01": {
+			Faculty:      "Psikologi",
+			ShortFaculty: "FPsi",
+			Major:        "Psikologi Profesi (Psychology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.00.08.01": {
+			Faculty:      "Psikologi",
+			ShortFaculty: "FPsi",
+			Major:        "Psikologi (Psychology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"07.00.08.01": {
+			Faculty:      "Psikologi",
+			ShortFaculty: "FPsi",
+			Major:        "Psikologi (Psychology)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.02.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Politik (Political Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.04.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Sosiologi (Sociology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.05.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Kriminologi (Criminology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.06.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Kesejahteraan Sosial (Social Welfare)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.08.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Hubungan Internasional (International Relations)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.01.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Komunikasi (Communication)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.07.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Antropologi Sosial (Social Anthropology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"05.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Fiskal (Fiscal Administration)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"06.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Negara (Public Administration)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"07.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Niaga (Business Administration)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.02.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Politik - Ekstensi (Political Science - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"02.05.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Kriminologi - Ekstensi (Criminology - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"08.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Fiskal - Ekstensi (Fiscal Administration - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"09.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Negara - Ekstensi (Public Administration - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"10.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Niaga - Ekstensi (Business Administration - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"07.01.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Komunikasi (Communication - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"02.04.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Sosiologi (Sociology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.06.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Kesejahteraan Sosial (Social Welfare)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.08.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Hub Internasional (International Relations)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.02.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Politik (Political Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.05.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Kriminologi (Criminology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.07.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Antropologi (Anthropology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.08.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Kajian Terorisme dalam Keamanan Internasional ()",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.01.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Komunikasi (Communication)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"11.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi (Administration)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.04.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Sosiologi (Sociology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.06.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Kesejahteraan Sosial (Social Welfare)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"04.02.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Politik (Political Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"04.05.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Kriminologi (Criminology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"04.07.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Antropologi (Anthropology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"05.01.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Komunikasi (Communication)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"12.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi (Administration)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"05.02.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Politik (Political Science)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"05.05.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Kriminologi (Criminology)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"06.01.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Komunikasi (Communication)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"13.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Fiskal (Fiscal Administration)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"14.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Negara (Public Administration)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"15.03.09.01": {
+			Faculty:      "Ilmu Sosial & Ilmu Politik",
+			ShortFaculty: "FISIP",
+			Major:        "Ilmu Administrasi Niaga (Business Administration)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Kesehatan Masyarakat (Public Health)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"01.04.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Studi Gizi (Nutrition)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"06.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Kesehatan Lingkungan (Kesehatan Lingkungan)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"xx.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Keselamatan dan Kesehatan Kerja (Keselamatan dan Kesehatan Kerja)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Kesehatan Masyarakat - Ekstensi (Public Health)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"01.03.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Epidemiologi (Epidemiology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.06.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Keselamatan & Kesehatan Kerja (Occupational Health & Safety)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Ilmu Kesehatan Masyarakat (Public Health Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.01.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Administrasi Rumah Sakit (Hospital Administration)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.03.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Epidemiologi (Epidemiology)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"05.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Ilmu Kesehatan Masyarakat (Public Health Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"01.01.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Asuransi Kesehatan (Health Insurance)",
+			Program:      "D3 (Diploma III)",
+		},
+		"01.06.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Keselamatan & Kesehatan Kerja (Occupational Health & Safety)",
+			Program:      "D3 (Diploma III)",
+		},
+		"01.07.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Kehumasan Pelayanan Kesehatan (Public Relation in Health Care)",
+			Program:      "D3 (Diploma III)",
+		},
+		"02.01.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Manajemen Informasi Kesehatan & Rekam Medis (Health Information Management & Medical Record)",
+			Program:      "D3 (Diploma III)",
+		},
+		"02.07.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Promosi & Pendidikan Kesehatan (Health Education & Promotion)",
+			Program:      "D3 (Diploma III)",
+		},
+		"03.01.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Manajemen Pelayanan Rumah Sakit (Hospital Services Management)",
+			Program:      "D3 (Diploma III)",
+		},
+		"04.00.10.01": {
+			Faculty:      "Kesehatan Masyarakat",
+			ShortFaculty: "FKM",
+			Major:        "Ilmu Kesehatan Masyarakat (Public Health Science)",
+			Program:      "S2 Kls Internasional (Intl. Class Graduate Program)",
+		},
+		"01.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Ilmu Komputer (Computer Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"06.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Sistem Informasi (Information System)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"07.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Sistem Informasi - Ekstensi (Information Systems - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"02.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Ilmu Komputer (Computer Science - Intl)",
+			Program:      "S1 Kls Internasional (Intl. Class Undergraduate Program)",
+		},
+		"03.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Ilmu Komputer (Computer Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Teknologi Informasi (Information Technology)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Ilmu Komputer (Computer Science)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"08.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Sistem Informasi (Information System)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"09.00.12.01": {
+			Faculty:      "Ilmu Komputer",
+			ShortFaculty: "Fasilkom",
+			Major:        "Ilmu Komputer (Computer Science)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ilmu Keperawatan (Nursing Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ilmu Keperawatan - Ekstensi (Nursing Science - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"04.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ilmu Keperawatan (Nursing)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"09.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ilmu Keperawatan (Nursing)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Profesi Keperawatan (Bachelor of Nursing)",
+			Program:      "Profesi (Profession Program)",
+		},
+		"05.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ners Spesialis Keperawatan Komunitas (Community Nursing Spesialist)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"06.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ners Spesialis Keperawatan Maternitas (Maternity Nursing Spesialist)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"07.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ners Spesialis Keperawatan Medikal Bedah (Surgery Medical Nursing Spesialist)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"08.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ners Spesialis Keperawatan Jiwa (Mental Care Nursing Spesialist)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"10.00.13.01": {
+			Faculty:      "Ilmu Keperawatan",
+			ShortFaculty: "FIK",
+			Major:        "Ners Spesialis Keperawatan Anak (Child Nursing Specialist)",
+			Program:      "Spesialis I (Specialist Program)",
+		},
+		"01.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Ilmu Kepolisian (Police Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"02.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Ilmu Lingkungan (Environmental Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Kependudukan & Ketenagaan Kerja (Population & Manpower Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"04.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Ketahanan Nasional (National Resilience)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Pengembangan Perkotaan (Urban Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"06.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Gender (Gender Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"07.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Wilayah Amerika (American Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"08.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Wilayah Eropa (European Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"09.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Wilayah Jepang (Japanese Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"10.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Kajian Wilayah Timur Tengah Islam (Islamics & Middle Eastern Studies)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"12.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Teknologi Biomedis (Biomedical Engineering)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"11.00.14.01": {
+			Faculty:      "Pascasarjana",
+			ShortFaculty: "Pascasarjana",
+			Major:        "Ilmu Lingkungan (Environmental Studies)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"01.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Perumahsakitan (Hospital Management)",
+			Program:      "D3 (Diploma III)",
+		},
+		"02.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Fisioterapi (Physiotherapy)",
+			Program:      "D3 (Diploma III)",
+		},
+		"03.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Okupasi Terapi (Occupational Therapy)",
+			Program:      "D3 (Diploma III)",
+		},
+		"04.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Akuntansi (Accounting)",
+			Program:      "D3 (Diploma III)",
+		},
+		"05.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Manajemen Informasi & Dokumen (Management of Information & Document)",
+			Program:      "D3 (Diploma III)",
+		},
+		"06.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Komunikasi (Communication)",
+			Program:      "D3 (Diploma III)",
+		},
+		"07.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Administrasi Asuransi & Aktuaria (Insurance & Actuarial Program)",
+			Program:      "D3 (Diploma III)",
+		},
+		"08.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Administrasi Keuangan & Perbankan (Finance & Banking Program)",
+			Program:      "D3 (Diploma III)",
+		},
+		"09.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Administrasi Perkantoran & Sekretari (Office & Secretarial Program)",
+			Program:      "D3 (Diploma III)",
+		},
+		"10.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Administrasi Perpajakan (Taxation Program)",
+			Program:      "D3 (Diploma III)",
+		},
+		"11.00.15.01": {
+			Faculty:      "Vokasi",
+			ShortFaculty: "Vokasi",
+			Major:        "Pariwisata (Cultural Tourism)",
+			Program:      "D3 (Diploma III)",
+		},
+		"01.00.16.01": {
+			Faculty:      "Perolehan Kredit",
+			ShortFaculty: "Perolehan Kredit",
+			Major:        "Pertukaran Mahasiswa (Student Exchange)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.00.16.01": {
+			Faculty:      "Perolehan Kredit",
+			ShortFaculty: "Perolehan Kredit",
+			Major:        "Pertukaran Mahasiswa (Student Exchange)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"03.00.16.01": {
+			Faculty:      "Perolehan Kredit",
+			ShortFaculty: "Perolehan Kredit",
+			Major:        "Pertukaran Mahasiswa (Student Exchange)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.HC.16.01": {
+			Faculty:      "Perolehan Kredit",
+			ShortFaculty: "Perolehan Kredit",
+			Major:        "Honoris Causa (Honoris Causa)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"01.00.17.01": {
+			Faculty:      "Farmasi",
+			ShortFaculty: "FF",
+			Major:        "Farmasi (Pharmacy)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"04.00.17.01": {
+			Faculty:      "Farmasi",
+			ShortFaculty: "FF",
+			Major:        "Ilmu Kefarmasian (Pharmaceutical Science)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"05.00.17.01": {
+			Faculty:      "Farmasi",
+			ShortFaculty: "FF",
+			Major:        "Herbal (Herbal)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"06.00.17.01": {
+			Faculty:      "Farmasi",
+			ShortFaculty: "FF",
+			Major:        "Farmasi (Pharmacy)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"03.00.17.01": {
+			Faculty:      "Farmasi",
+			ShortFaculty: "FF",
+			Major:        "Apoteker (Apothecary)",
+			Program:      "Profesi (Profession Program)",
+		},
+		"02.00.17.01": {
+			Faculty:      "Farmasi",
+			ShortFaculty: "FF",
+			Major:        "Farmasi (Pharmacy)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"01.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Fiskal (Fiscal Administration)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"02.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Negara (Public Administration)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"03.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Niaga (Business Administration)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"04.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Fiskal (Fiscal Administration)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"05.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Negara (Public Administration)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"06.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Niaga (Business Administration)",
+			Program:      "S1 Paralel (S1 Paralel)",
+		},
+		"07.00.18.01:": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Fiskal - Ekstensi (Fiscal Administration - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"08.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Negara - Ekstensi (Public Administration - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"09.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi Niaga - Ekstensi (Business Administration - Ext)",
+			Program:      "S1 Ekstensi (Extended Undergraduate Program)",
+		},
+		"10.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi (Administration)",
+			Program:      "S2 (Graduate Program)",
+		},
+		"11.00.18.01": {
+			Faculty:      "Ilmu Administrasi",
+			ShortFaculty: "FIA",
+			Major:        "Ilmu Administrasi (Administration)",
+			Program:      "S3 (Doctoral Program)",
+		},
+		"07.02.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Geologi (Geology)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"06.02.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Geofisika (Geophysics)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"04.01.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Statistika (Statistics)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+		"05.01.03.01": {
+			Faculty:      "Matematika & Ilmu Pengetahuan Alam",
+			ShortFaculty: "FMIPA",
+			Major:        "Aktuaria (Actuarial Science)",
+			Program:      "S1 Reguler (Undergraduate Program)",
+		},
+	}
+
+	if jurusan, ok := data[kdOrg]; ok {
+		return jurusan
+	}
+	return Jurusan{}
 }
