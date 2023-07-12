@@ -24,4 +24,4 @@ The API call can take up to 4 seconds. This is purely because the default implem
 }
 ```
 
-note that `serviceUrl` need to be url encoded for this to it to work. `casUrl` need defined protocol and ended with backslash.
+note that `casUrl` need defined protocol and ended with backslash.
