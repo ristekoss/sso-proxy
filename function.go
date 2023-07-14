@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 
 	"github.com/clbanning/mxj/v2"
 
@@ -13,7 +12,14 @@ import (
 	"github.com/gocolly/colly/v2"
 )
 
+var (
+	defaultServiceUrl string
+	defaultCasUrl     string
+)
+
 func init() {
+	defaultServiceUrl = "http://localhost:8081/"
+	defaultCasUrl = "https://sso.ui.ac.id/cas2/"
 	functions.HTTP("Proxy", Proxy)
 }
 
@@ -25,9 +31,6 @@ type Request struct {
 }
 
 func Proxy(w http.ResponseWriter, r *http.Request) {
-	defaultServiceUrl := "http://localhost:8081/"
-	defaultCasUrl := "https://sso.ui.ac.id/cas2/"
-
 	defer func() {
 		if r := recover(); r != nil {
 			res, _ := json.Marshal(map[string]string{
@@ -55,22 +58,12 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 		data.ServiceUrl = defaultServiceUrl
 	}
 
-	serviceUrl, err := url.Parse(data.ServiceUrl)
-	if err != nil {
-		res, _ := json.Marshal(map[string]string{
-			"error": "failed to parse service url: " + err.Error(),
-		})
-		http.Error(w, string(res), http.StatusBadRequest)
-		return
-	}
-
-	data.ServiceUrl = url.QueryEscape(serviceUrl.String())
-
 	if data.CasUrl == "" {
 		data.CasUrl = defaultCasUrl
 	}
 
 	loginUrl := fmt.Sprint(data.CasUrl, "login?service=", data.ServiceUrl)
+	fmt.Println(loginUrl)
 
 	formData := map[string]string{
 		"username": data.Username,

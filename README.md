@@ -20,7 +20,7 @@ The API call can take up to 4 seconds. This is purely because the default implem
   "username": "username",
   "password": "password",
   "casUrl": "https://sso.ui.ac.id/cas/",
-  "serviceUrl": "http%3A%2F%2Flocalhost%3A8080%2F"
+  "serviceUrl": "http://localhost:8080/"
 }
 ```
 
