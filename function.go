@@ -3,15 +3,16 @@ package function
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/clbanning/mxj/v2"
+	"github.com/spf13/viper"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/gocolly/colly/v2"
 
-   "github.com/rs/zerolog/log"
+	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -20,8 +21,16 @@ var (
 )
 
 func init() {
-	defaultServiceUrl = "http://localhost:8081/"
-	defaultCasUrl = "https://sso.ui.ac.id/cas2/"
+	viper.AddConfigPath(".")
+	viper.SetConfigFile(".env")
+
+	viper.SetDefault("service_url", "http://localhost:8081/")
+	viper.SetDefault("cas_url", "https://sso.ui.ac.id/cas2/")
+
+	viper.ReadInConfig()
+
+	defaultServiceUrl = viper.GetString("service_url")
+	defaultCasUrl = viper.GetString("cas_url")
 	functions.HTTP("Proxy", Proxy)
 }
 
@@ -65,7 +74,9 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	loginUrl := fmt.Sprint(data.CasUrl, "login?service=", data.ServiceUrl)
-	log.Print("loginUrl: ", loginUrl)
+
+	log.Info().Str("loginUrl", loginUrl).Msg("")
+	log.Debug().Str("username", data.Username).Msg("")
 
 	formData := map[string]string{
 		"username": data.Username,
@@ -160,7 +171,7 @@ func validateTicket(casUrl, serviceUrl, ticket string) (bodyBytes []byte, err er
 	}
 
 	defer resp.Body.Close()
-	bodyBytes, err = ioutil.ReadAll(resp.Body)
+	bodyBytes, err = io.ReadAll(resp.Body)
 	return bodyBytes, nil
 }
 
