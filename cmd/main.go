@@ -14,6 +14,8 @@ import (
 )
 
 func main() {
+	os.Setenv("FUNCTION_TARGET", "Proxy")
+
 	config, err := LoadConfig()
 	if err != nil {
 		log.Fatal().AnErr("LoadConfig", err)
