@@ -10,6 +10,8 @@ import (
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/gocolly/colly/v2"
+
+   "github.com/rs/zerolog/log"
 )
 
 var (
@@ -63,7 +65,7 @@ func Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	loginUrl := fmt.Sprint(data.CasUrl, "login?service=", data.ServiceUrl)
-	fmt.Println(loginUrl)
+	log.Print("loginUrl: ", loginUrl)
 
 	formData := map[string]string{
 		"username": data.Username,
