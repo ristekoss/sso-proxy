@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  sso-proxy:
+    container_name: sso-proxy
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT}:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL}
+      - DISABLE_LOGGING=${DISABLE_LOGGING}
+      - APP_ENV=${APP_ENV}
+      - SERVICE_URL=${SERVICE_URL}
+      - CAS_URL=${CAS_URL}
