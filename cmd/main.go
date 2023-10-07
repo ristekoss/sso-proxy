@@ -16,53 +16,40 @@ import (
 func main() {
 	os.Setenv("FUNCTION_TARGET", "Proxy")
 
-	config, err := LoadConfig()
+	err := LoadConfig()
 	if err != nil {
 		log.Fatal().AnErr("LoadConfig", err)
 	}
 
-	if config.AppEnv == "dev" {
+	if viper.GetString("APP_ENV") == "dev" {
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 	} else {
 		log.Logger = log.Output(os.Stdout)
 	}
 
-	if config.DisableLogging {
+	if viper.GetBool("DISABLE_LOGGING") {
 		log.Logger = log.Output(io.Discard)
 	}
 
-	zerolog.SetGlobalLevel(zerolog.Level(config.LogLevel))
+	zerolog.SetGlobalLevel(zerolog.Level(viper.GetInt("LOG_LEVEL")))
 
-	if err := funcframework.Start(config.Port); err != nil {
+	if err := funcframework.Start(viper.GetString("PORT")); err != nil {
 		log.Fatal().AnErr("funcframework.Start", err)
 	}
 }
 
-type Config struct {
-	Port           string `mapstructure:"PORT"`
-	AppEnv         string `mapstructure:"APP_ENV"`
-	LogLevel       int    `mapstructure:"LOG_LEVEL"`
-	DisableLogging bool   `mapstructure:"DISABLE_LOGGING"`
-}
-
-func LoadConfig() (config Config, err error) {
+func LoadConfig() (err error) {
 	viper.AddConfigPath(".")
 	viper.SetConfigFile(".env")
 	viper.AutomaticEnv()
+	viper.SetEnvPrefix("")
+	viper.AllowEmptyEnv(true)
 
-	// default config
-	config = Config{
-		Port:           "8080",
-		AppEnv:         "dev",
-		LogLevel:       int(zerolog.InfoLevel),
-		DisableLogging: false,
-	}
+	viper.SetDefault("PORT", "8080")
+	viper.SetDefault("APP_ENV", "dev")
+	viper.SetDefault("LOG_LEVEL", int(zerolog.InfoLevel))
+	viper.SetDefault("DISABLE_LOGGING", false)
 
 	err = viper.ReadInConfig()
-	if err != nil {
-		return config, err
-	}
-
-	err = viper.Unmarshal(&config)
-	return config, err
+	return err
 }
