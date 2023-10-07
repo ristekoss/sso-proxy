@@ -21,14 +21,6 @@ var (
 )
 
 func init() {
-	viper.AddConfigPath(".")
-	viper.SetConfigFile(".env")
-
-	viper.SetDefault("service_url", "http://localhost:8081/")
-	viper.SetDefault("cas_url", "https://sso.ui.ac.id/cas2/")
-
-	viper.ReadInConfig()
-
 	defaultServiceUrl = viper.GetString("service_url")
 	defaultCasUrl = viper.GetString("cas_url")
 	functions.HTTP("Proxy", Proxy)

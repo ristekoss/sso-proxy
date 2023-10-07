@@ -49,6 +49,8 @@ func LoadConfig() (err error) {
 	viper.SetDefault("APP_ENV", "dev")
 	viper.SetDefault("LOG_LEVEL", int(zerolog.InfoLevel))
 	viper.SetDefault("DISABLE_LOGGING", false)
+	viper.SetDefault("SERVICE_URL", "http://localhost:8081/")
+	viper.SetDefault("CAS_URL", "https://sso.ui.ac.id/cas2/")
 
 	err = viper.ReadInConfig()
 	return err
