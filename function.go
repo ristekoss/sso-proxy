@@ -21,8 +21,8 @@ var (
 )
 
 func init() {
-	defaultServiceUrl = viper.GetString("service_url")
-	defaultCasUrl = viper.GetString("cas_url")
+	defaultServiceUrl = viper.GetString("SERVICE_URL")
+	defaultCasUrl = viper.GetString("CAS_URL")
 	functions.HTTP("Proxy", Proxy)
 }
 
