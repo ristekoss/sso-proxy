@@ -1,0 +1,20 @@
+name: Build Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    uses: RistekCSUI/infra-workflows/.github/workflows/dockerhub-service-build.yml@main
+    with:
+      SERVICES: ''
+      INSTANCE: ''
+      IMAGE: sso-proxy
+      DOCKERHUB_USER: ristekoss
+      PLATFORMS: linux/amd64
+      IMAGE_TAG: latest
+      RUN_CENTRAL_INFRA_DEPLOY: false
+    secrets:
+      GH_TOKEN: ''
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
