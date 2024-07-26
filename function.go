@@ -26,6 +26,12 @@ func init() {
 	functions.HTTP("Proxy", Proxy)
 }
 
+// To be used in non-cloud function environments
+func Configure(serviceUrl, casUrl string) {
+	defaultServiceUrl = serviceUrl
+	defaultCasUrl = casUrl
+}
+
 type Request struct {
 	Username   string `json:"username"`
 	Password   string `json:"password"`

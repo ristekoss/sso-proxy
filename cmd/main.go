@@ -9,7 +9,7 @@ import (
 
 	// Blank-import the function package so the init() runs
 	"github.com/GoogleCloudPlatform/functions-framework-go/funcframework"
-	_ "github.com/ristekoss/ssoui-rest-proxy"
+	sso "github.com/ristekoss/ssoui-rest-proxy"
 	"github.com/spf13/viper"
 )
 
@@ -32,6 +32,8 @@ func main() {
 	}
 
 	zerolog.SetGlobalLevel(zerolog.Level(viper.GetInt("LOG_LEVEL")))
+
+	sso.Configure(viper.GetString("SERVICE_URL"), viper.GetString("CAS_URL"))
 
 	if err := funcframework.Start(viper.GetString("PORT")); err != nil {
 		log.Fatal().AnErr("funcframework.Start", err)
